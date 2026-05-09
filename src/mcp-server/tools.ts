@@ -3,7 +3,9 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import type { WhatsAppClient } from './whatsapp.js';
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import type { WhatsAppClient, WhatsAppChat } from './whatsapp.js';
 import {
   GetMessagesInputSchema,
   ExportChatInputSchema,
@@ -11,8 +13,18 @@ import {
   GroupInfoInputSchema,
   SendMessageInputSchema,
   ReplyToMessageInputSchema,
+  ListChatsInputSchema,
+  GetDMMessagesInputSchema,
+  SendDMInputSchema,
+  ReplyToDMInputSchema,
+  SearchDMsInputSchema,
+  AnalyzeDMInputSchema,
+  AnalyzeGroupInputSchema,
   type WhatsAppGroup,
 } from './types.js';
+import { analyzeChat, crossGroupSynthesis } from '../processor/analyzer.js';
+import { formatBriefing } from '../processor/briefing.js';
+import type { UserContext } from '../processor/analyzer.js';
 
 // ── Fuzzy Group Name Matching ───────────────────────────────────────────────
 
@@ -103,6 +115,98 @@ async function resolveGroupOrError(
     };
   }
   return { group };
+}
+
+// ── DM Contact Resolution ───────────────────────────────────────────────────
+
+async function resolveDMContact(
+  client: WhatsAppClient,
+  nameOrNumber: string,
+): Promise<WhatsAppChat | null> {
+  const chats = await client.getDirectChats();
+  const norm = normalize(nameOrNumber);
+  const numOnly = nameOrNumber.replace(/\D/g, '');
+
+  // 1. Exact name match
+  const exact = chats.find((c) => normalize(c.name) === norm);
+  if (exact) return exact;
+
+  // 2. Phone number suffix match (7+ digits)
+  if (numOnly.length >= 7) {
+    const byNumber = chats.find((c) => c.jid.replace('@s.whatsapp.net', '').endsWith(numOnly));
+    if (byNumber) return byNumber;
+  }
+
+  // 3. Substring
+  const sub = chats.find(
+    (c) => normalize(c.name).includes(norm) || norm.includes(normalize(c.name)),
+  );
+  if (sub) return sub;
+
+  // 4. Levenshtein < 3
+  let best: WhatsAppChat | null = null;
+  let bestDist = Infinity;
+  for (const c of chats) {
+    const d = levenshtein(normalize(c.name), norm);
+    if (d < bestDist) { bestDist = d; best = c; }
+  }
+  return bestDist < 3 ? best : null;
+}
+
+async function resolveDMOrError(
+  client: WhatsAppClient,
+  nameOrNumber: string,
+): Promise<
+  | { chat: WhatsAppChat; error?: undefined }
+  | { chat?: undefined; error: { type: 'text'; text: string } }
+> {
+  const chat = await resolveDMContact(client, nameOrNumber);
+  if (!chat) {
+    const chats = await client.getDirectChats();
+    const names = chats.slice(0, 20).map((c) => c.name).join(', ');
+    return {
+      error: {
+        type: 'text' as const,
+        text: `No DM contact found matching "${nameOrNumber}". Recent contacts: ${names}`,
+      },
+    };
+  }
+  return { chat };
+}
+
+// ── Analysis Helpers ────────────────────────────────────────────────────────
+
+const DEFAULT_CONTEXT: UserContext = {
+  name: 'User',
+  aliases: [],
+  role: 'WhatsApp user',
+  focusAreas: ['technology', 'business'],
+  opportunityTypes: ['collaboration', 'learning'],
+  contentOutlets: [],
+};
+
+function loadUserContext(): UserContext {
+  const configPath = join(process.cwd(), 'config', 'user-context.json');
+  try {
+    if (existsSync(configPath)) {
+      const raw = readFileSync(configPath, 'utf-8');
+      return JSON.parse(raw) as UserContext;
+    }
+  } catch {
+    // fall through to default
+  }
+  return DEFAULT_CONTEXT;
+}
+
+function messagesToParsed(messages: Awaited<ReturnType<WhatsAppClient['getGroupMessages']>>) {
+  return messages.map((m) => ({
+    platform: 'whatsapp' as const,
+    timestamp: new Date(m.timestamp * 1000),
+    author: m.authorName || m.author,
+    body: m.body,
+    isMedia: m.hasMedia,
+    isSystem: false,
+  }));
 }
 
 // ── Tool Registration ───────────────────────────────────────────────────────
@@ -233,20 +337,104 @@ export function registerTools(server: Server, client: WhatsAppClient): void {
         inputSchema: {
           type: 'object' as const,
           properties: {
-            groupName: {
-              type: 'string',
-              description: 'Name of the group (fuzzy-matched)',
-            },
-            messageId: {
-              type: 'string',
-              description: 'The ID of the message to reply to (from whatsapp_get_messages)',
-            },
-            message: {
-              type: 'string',
-              description: 'Reply text to send',
-            },
+            groupName: { type: 'string', description: 'Name of the group (fuzzy-matched)' },
+            messageId: { type: 'string', description: 'The ID of the message to reply to' },
+            message: { type: 'string', description: 'Reply text to send' },
           },
           required: ['groupName', 'messageId', 'message'],
+        },
+      },
+      {
+        name: 'whatsapp_analyze_group',
+        description:
+          'Run intelligence analysis on a WhatsApp group: extracts themes, big ideas, opportunities, participation, live threads, and notable quotes.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            groupName: { type: 'string', description: 'Name of the group (fuzzy-matched)' },
+            limit: { type: 'number', description: 'Messages to analyse (default: 300, max: 500)', default: 300 },
+            afterDate: { type: 'string', description: 'Only messages after this date (YYYY-MM-DD)' },
+            beforeDate: { type: 'string', description: 'Only messages before this date (YYYY-MM-DD)' },
+          },
+          required: ['groupName'],
+        },
+      },
+      // ── DM Tools ────────────────────────────────────────────────────────
+      {
+        name: 'whatsapp_list_chats',
+        description: 'List direct message (DM) conversations sorted by most recent activity.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            limit: { type: 'number', description: 'Max contacts to return (default: 50)', default: 50 },
+          },
+          required: [],
+        },
+      },
+      {
+        name: 'whatsapp_get_dm_messages',
+        description: 'Get messages from a direct message conversation. Supports fuzzy contact name matching and date range filtering.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            contactName: { type: 'string', description: 'Contact name or phone number (fuzzy-matched)' },
+            limit: { type: 'number', description: 'Max messages to return (default: 100)', default: 100 },
+            afterDate: { type: 'string', description: 'Only messages after this date (YYYY-MM-DD)' },
+            beforeDate: { type: 'string', description: 'Only messages before this date (YYYY-MM-DD)' },
+          },
+          required: ['contactName'],
+        },
+      },
+      {
+        name: 'whatsapp_send_dm',
+        description: 'Send a direct message to a WhatsApp contact. Uses fuzzy name matching.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            contactName: { type: 'string', description: 'Contact name or phone number (fuzzy-matched)' },
+            message: { type: 'string', description: 'Message text to send' },
+          },
+          required: ['contactName', 'message'],
+        },
+      },
+      {
+        name: 'whatsapp_reply_to_dm',
+        description: 'Send a quoted reply to a specific DM message.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            contactName: { type: 'string', description: 'Contact name or phone number (fuzzy-matched)' },
+            messageId: { type: 'string', description: 'The ID of the message to reply to' },
+            message: { type: 'string', description: 'Reply text to send' },
+          },
+          required: ['contactName', 'messageId', 'message'],
+        },
+      },
+      {
+        name: 'whatsapp_search_dms',
+        description: 'Search messages across all DM conversations, or within a specific contact thread.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            query: { type: 'string', description: 'Search keyword or phrase' },
+            contactName: { type: 'string', description: 'Optional: limit search to one contact' },
+            limit: { type: 'number', description: 'Max results (default: 50)', default: 50 },
+          },
+          required: ['query'],
+        },
+      },
+      {
+        name: 'whatsapp_analyze_dm',
+        description: 'Run intelligence analysis on a DM conversation thread.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            contactName: { type: 'string', description: 'Contact name or phone number (fuzzy-matched)' },
+            limit: { type: 'number', description: 'Messages to analyse (default: 100)', default: 100 },
+            afterDate: { type: 'string', description: 'Only messages after this date (YYYY-MM-DD)' },
+            beforeDate: { type: 'string', description: 'Only messages before this date (YYYY-MM-DD)' },
+          },
+          required: ['contactName'],
         },
       },
     ],
@@ -415,6 +603,131 @@ export function registerTools(server: Server, client: WhatsAppClient): void {
               text: `Reply sent to "${result.group.name}" (quoting ${parsed.messageId}).\nMessage ID: ${sent.id}\nTimestamp: ${new Date(sent.timestamp * 1000).toISOString()}`,
             }],
           };
+        }
+
+        case 'whatsapp_analyze_group': {
+          const parsed = AnalyzeGroupInputSchema.parse(args);
+          const result = await resolveGroupOrError(client, parsed.groupName);
+          if (result.error) return { content: [result.error], isError: true };
+
+          const options: { limit: number; after?: number; before?: number } = { limit: parsed.limit };
+          if (parsed.afterDate) options.after = Math.floor(new Date(parsed.afterDate + 'T00:00:00Z').getTime() / 1000);
+          if (parsed.beforeDate) options.before = Math.floor(new Date(parsed.beforeDate + 'T23:59:59Z').getTime() / 1000);
+
+          const messages = await client.getGroupMessages(result.group.id, options);
+          if (messages.length === 0) {
+            return { content: [{ type: 'text' as const, text: `No messages found in "${result.group.name}" for the given range.` }] };
+          }
+
+          const ctx = loadUserContext();
+          const parsed2 = messagesToParsed(messages);
+          const analysis = analyzeChat(parsed2, ctx, result.group.name);
+          const briefing = formatBriefing(analysis, { sections: parsed.sections });
+          return { content: [{ type: 'text' as const, text: briefing }] };
+        }
+
+        case 'whatsapp_list_chats': {
+          const parsed = ListChatsInputSchema.parse(args);
+          const chats = await client.getDirectChats();
+          const limited = chats.slice(0, parsed.limit);
+          const formatted = limited
+            .map((c, i) => {
+              const date = new Date(c.lastActivityTimestamp * 1000).toISOString();
+              const preview = c.lastMessage ? c.lastMessage.slice(0, 60) : '(no messages)';
+              return `${i + 1}. ${c.name}\n   Last active: ${date}\n   Last message: ${preview}`;
+            })
+            .join('\n\n');
+          return {
+            content: [{ type: 'text' as const, text: `Found ${chats.length} DM contacts (showing ${limited.length}):\n\n${formatted}` }],
+          };
+        }
+
+        case 'whatsapp_get_dm_messages': {
+          const parsed = GetDMMessagesInputSchema.parse(args);
+          const result = await resolveDMOrError(client, parsed.contactName);
+          if (result.error) return { content: [result.error], isError: true };
+
+          const options: { limit: number; after?: number; before?: number } = { limit: parsed.limit };
+          if (parsed.afterDate) options.after = Math.floor(new Date(parsed.afterDate + 'T00:00:00Z').getTime() / 1000);
+          if (parsed.beforeDate) options.before = Math.floor(new Date(parsed.beforeDate + 'T23:59:59Z').getTime() / 1000);
+
+          const messages = await client.getDMMessages(result.chat.jid, options);
+          const formatted = messages
+            .map((m) => {
+              const date = new Date(m.timestamp * 1000).toISOString();
+              const media = m.hasMedia ? ' [media]' : '';
+              const quote = m.quotedMsg ? `\n   > ${m.quotedMsg.author}: ${m.quotedMsg.body.slice(0, 60)}` : '';
+              return `[${date}] [id:${m.id}] ${m.authorName}${media}: ${m.body}${quote}`;
+            })
+            .join('\n');
+          return {
+            content: [{ type: 'text' as const, text: `${messages.length} messages with "${result.chat.name}":\n\n${formatted}` }],
+          };
+        }
+
+        case 'whatsapp_send_dm': {
+          const parsed = SendDMInputSchema.parse(args);
+          const result = await resolveDMOrError(client, parsed.contactName);
+          if (result.error) return { content: [result.error], isError: true };
+
+          const sent = await client.sendMessage(result.chat.jid, parsed.message);
+          return {
+            content: [{ type: 'text' as const, text: `Message sent to "${result.chat.name}".\nMessage ID: ${sent.id}\nTimestamp: ${new Date(sent.timestamp * 1000).toISOString()}` }],
+          };
+        }
+
+        case 'whatsapp_reply_to_dm': {
+          const parsed = ReplyToDMInputSchema.parse(args);
+          const result = await resolveDMOrError(client, parsed.contactName);
+          if (result.error) return { content: [result.error], isError: true };
+
+          const sent = await client.sendMessage(result.chat.jid, parsed.message, parsed.messageId);
+          return {
+            content: [{ type: 'text' as const, text: `Reply sent to "${result.chat.name}" (quoting ${parsed.messageId}).\nMessage ID: ${sent.id}\nTimestamp: ${new Date(sent.timestamp * 1000).toISOString()}` }],
+          };
+        }
+
+        case 'whatsapp_search_dms': {
+          const parsed = SearchDMsInputSchema.parse(args);
+          let jid: string | undefined;
+          if (parsed.contactName) {
+            const result = await resolveDMOrError(client, parsed.contactName);
+            if (result.error) return { content: [result.error], isError: true };
+            jid = result.chat.jid;
+          }
+
+          const results = await client.searchDMs(parsed.query, jid, parsed.limit);
+          const formatted = results
+            .map((m) => {
+              const date = new Date(m.timestamp * 1000).toISOString();
+              return `[${date}] [${m.chatName}] [id:${m.id}] ${m.authorName}: ${m.body}`;
+            })
+            .join('\n');
+          const scope = parsed.contactName ? `in "${parsed.contactName}"` : 'across all DMs';
+          return {
+            content: [{ type: 'text' as const, text: `${results.length} results for "${parsed.query}" ${scope}:\n\n${formatted}` }],
+          };
+        }
+
+        case 'whatsapp_analyze_dm': {
+          const parsed = AnalyzeDMInputSchema.parse(args);
+          const result = await resolveDMOrError(client, parsed.contactName);
+          if (result.error) return { content: [result.error], isError: true };
+
+          const options: { limit: number; after?: number; before?: number } = { limit: parsed.limit };
+          if (parsed.afterDate) options.after = Math.floor(new Date(parsed.afterDate + 'T00:00:00Z').getTime() / 1000);
+          if (parsed.beforeDate) options.before = Math.floor(new Date(parsed.beforeDate + 'T23:59:59Z').getTime() / 1000);
+
+          const messages = await client.getDMMessages(result.chat.jid, options);
+          if (messages.length === 0) {
+            return { content: [{ type: 'text' as const, text: `No messages found with "${result.chat.name}" for the given range.` }] };
+          }
+
+          const ctx = loadUserContext();
+          const parsed2 = messagesToParsed(messages);
+          const analysis = analyzeChat(parsed2, ctx, result.chat.name);
+          const briefing = formatBriefing(analysis, { sections: parsed.sections });
+          return { content: [{ type: 'text' as const, text: briefing }] };
         }
 
         default:

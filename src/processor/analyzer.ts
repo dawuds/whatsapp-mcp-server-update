@@ -58,6 +58,25 @@ export const EXAMPLE_CONTEXT: UserContext = {
   contentOutlets: ['Your Newsletter', 'LinkedIn'],
 };
 
+/**
+ * Load user context from config/user-context.json if present,
+ * otherwise fall back to EXAMPLE_CONTEXT.
+ */
+export function loadUserContext(): UserContext {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { readFileSync, existsSync } = require('fs');
+    const { join } = require('path');
+    const configPath = join(process.cwd(), 'config', 'user-context.json');
+    if (existsSync(configPath)) {
+      return JSON.parse(readFileSync(configPath, 'utf-8')) as UserContext;
+    }
+  } catch {
+    // fall through
+  }
+  return EXAMPLE_CONTEXT;
+}
+
 // ---------------------------------------------------------------------------
 // Analysis Result Types
 // ---------------------------------------------------------------------------

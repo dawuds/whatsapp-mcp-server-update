@@ -1,0 +1,19 @@
+{
+  "name": "Your Name",
+  "aliases": ["YourName", "yourname", "YN"],
+  "role": "Your role and company",
+  "focusAreas": [
+    "your focus area 1",
+    "your focus area 2",
+    "your product or platform",
+    "your domain expertise"
+  ],
+  "opportunityTypes": [
+    "partnerships",
+    "speaking",
+    "pain points your product solves",
+    "content ideas",
+    "peer collaboration"
+  ],
+  "contentOutlets": ["Your Newsletter", "LinkedIn"]
+}

@@ -117,3 +117,65 @@ export const ReplyToMessageInputSchema = z.object({
 });
 
 export type ReplyToMessageInput = z.infer<typeof ReplyToMessageInputSchema>;
+
+// ── Analyze Group ───────────────────────────────────────────────────────────
+
+export const AnalyzeGroupInputSchema = z.object({
+  groupName: z.string().min(1, 'Group name is required'),
+  limit: z.number().int().positive().max(500).default(300),
+  afterDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  beforeDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  sections: z.array(z.string()).optional(),
+});
+
+export type AnalyzeGroupInput = z.infer<typeof AnalyzeGroupInputSchema>;
+
+// ── DM Tools ────────────────────────────────────────────────────────────────
+
+export const ListChatsInputSchema = z.object({
+  limit: z.number().int().positive().max(200).default(50),
+});
+
+export type ListChatsInput = z.infer<typeof ListChatsInputSchema>;
+
+export const GetDMMessagesInputSchema = z.object({
+  contactName: z.string().min(1, 'Contact name or phone number is required'),
+  limit: z.number().int().positive().max(500).default(100),
+  afterDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  beforeDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+
+export type GetDMMessagesInput = z.infer<typeof GetDMMessagesInputSchema>;
+
+export const SendDMInputSchema = z.object({
+  contactName: z.string().min(1, 'Contact name or phone number is required'),
+  message: z.string().min(1, 'Message text is required'),
+});
+
+export type SendDMInput = z.infer<typeof SendDMInputSchema>;
+
+export const ReplyToDMInputSchema = z.object({
+  contactName: z.string().min(1, 'Contact name or phone number is required'),
+  messageId: z.string().min(1, 'Message ID to reply to is required'),
+  message: z.string().min(1, 'Reply text is required'),
+});
+
+export type ReplyToDMInput = z.infer<typeof ReplyToDMInputSchema>;
+
+export const SearchDMsInputSchema = z.object({
+  query: z.string().min(1, 'Search query is required'),
+  contactName: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(200).default(50),
+});
+
+export type SearchDMsInput = z.infer<typeof SearchDMsInputSchema>;
+
+export const AnalyzeDMInputSchema = z.object({
+  contactName: z.string().min(1, 'Contact name or phone number is required'),
+  limit: z.number().int().positive().max(500).default(100),
+  afterDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  beforeDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  sections: z.array(z.string()).optional(),
+});
+
+export type AnalyzeDMInput = z.infer<typeof AnalyzeDMInputSchema>;

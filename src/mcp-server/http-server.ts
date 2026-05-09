@@ -12,6 +12,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { getWhatsAppClient } from './whatsapp.js';
@@ -99,6 +100,33 @@ async function main(): Promise<void> {
     logError('Failed to initialize WhatsApp client', error);
     process.exit(1);
   }
+
+  // ---------------------------------------------------------------------------
+  // ccmd event listener — fires instantly when a self-sent "ccmd ..." message
+  // arrives. No polling. Spawns claude -p pointing back at this HTTP server.
+  // ---------------------------------------------------------------------------
+  waClient.onMessage((msg) => {
+    if (!msg.fromMe) return;
+    const text = msg.body.trim();
+    if (!text.toLowerCase().startsWith('ccmd')) return;
+
+    const prompt = text.slice(4).trim() || 'ccmd status';
+    log(`ccmd detected: "${prompt.slice(0, 80)}"`);
+
+    const mcpConfig = JSON.stringify({
+      mcpServers: { whatsapp: { type: 'http', url: `http://localhost:${PORT}/mcp` } },
+    });
+
+    const child = spawn(
+      process.env.CLAUDE_BIN || 'claude',
+      ['-p', '--model', 'sonnet', '--dangerously-skip-permissions',
+       '--mcp-config', mcpConfig, '--', prompt],
+      { env: { ...process.env, HOME: process.env.HOME || '/home/dawud' }, stdio: 'inherit' },
+    );
+    child.on('error', (err) => logError('ccmd spawn error', err));
+    child.on('exit', (code) => log(`ccmd finished (exit ${code}): "${prompt.slice(0, 60)}"`));
+  });
+  log('ccmd event listener registered — no polling needed');
 
   /**
    * Create a new MCP server + transport pair for a session.

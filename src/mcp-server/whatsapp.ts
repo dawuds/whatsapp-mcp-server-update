@@ -52,6 +52,22 @@ export interface GetMessagesOptions {
   before?: number;
 }
 
+export interface WhatsAppChat {
+  jid: string;
+  name: string;
+  lastMessage: string;
+  lastActivityTimestamp: number;
+}
+
+export interface MessageEvent {
+  jid: string;
+  body: string;
+  authorName: string;
+  fromMe: boolean;
+  id: string;
+  timestamp: number;
+}
+
 // ---------------------------------------------------------------------------
 // Logging — always stderr so MCP protocol (stdout) is not polluted
 // ---------------------------------------------------------------------------
@@ -160,6 +176,10 @@ class MessageBuffer {
 
   get groupCount(): number {
     return this.buffers.size;
+  }
+
+  getJids(): string[] {
+    return [...this.buffers.keys()];
   }
 
   rehydrate(): boolean {
@@ -288,6 +308,7 @@ export class WhatsAppClient {
   private readyResolve: (() => void) | null = null;
   private destroying = false;
   private saveCreds: (() => Promise<void>) | null = null;
+  private messageCallbacks: Array<(msg: MessageEvent) => void> = [];
 
   private static readonly AUTH_DIR = '.baileys_auth';
   private static readonly BAILEYS_LOGGER = pino({ level: 'silent' }, pino.destination(2));
@@ -438,6 +459,81 @@ export class WhatsAppClient {
   }
 
   // -----------------------------------------------------------------------
+  // DMs
+  // -----------------------------------------------------------------------
+
+  async getDirectChats(): Promise<WhatsAppChat[]> {
+    this.ensureReady();
+    const jids = this.buffer.getJids().filter((j) => j.endsWith('@s.whatsapp.net'));
+    const chats: WhatsAppChat[] = [];
+    for (const jid of jids) {
+      const entries = this.buffer.getForGroup(jid);
+      if (entries.length === 0) continue;
+      const last = entries[entries.length - 1];
+      const name = this.contacts.get(jid) || jid.replace(/@.*/, '');
+      chats.push({ jid, name, lastMessage: last.body || '', lastActivityTimestamp: last.timestamp });
+    }
+    chats.sort((a, b) => b.lastActivityTimestamp - a.lastActivityTimestamp);
+    log('info', `getDirectChats: returning ${chats.length} DM chats`);
+    return chats;
+  }
+
+  async getDMMessages(jid: string, options: GetMessagesOptions = {}): Promise<WhatsAppMessageEntry[]> {
+    this.ensureReady();
+    const { limit = 100, after, before } = options;
+    log('info', `getDMMessages: jid=${jid}, limit=${limit}`);
+    const entries = this.buffer.get(jid, limit, after, before);
+    return entries.map((e) => ({
+      id: e.id,
+      body: e.body,
+      author: e.author,
+      authorName: e.authorName,
+      timestamp: e.timestamp,
+      hasMedia: e.hasMedia,
+      isForwarded: e.isForwarded,
+      quotedMsg: e.quotedMsg,
+    }));
+  }
+
+  async searchDMs(
+    query: string,
+    jid?: string,
+    limit = 50,
+  ): Promise<(WhatsAppMessageEntry & { chatJid: string; chatName: string })[]> {
+    this.ensureReady();
+    const lowerQuery = query.toLowerCase();
+    const dmJids = jid
+      ? [jid]
+      : this.buffer.getJids().filter((j) => j.endsWith('@s.whatsapp.net'));
+
+    const results: (WhatsAppMessageEntry & { chatJid: string; chatName: string })[] = [];
+    for (const dmJid of dmJids) {
+      const entries = this.buffer.getForGroup(dmJid);
+      const chatName = this.contacts.get(dmJid) || dmJid.replace(/@.*/, '');
+      for (const entry of entries) {
+        if (entry.body.toLowerCase().includes(lowerQuery)) {
+          results.push({ ...entry, chatJid: dmJid, chatName });
+          if (results.length >= limit) return results;
+        }
+      }
+    }
+    log('info', `searchDMs: "${query}" → ${results.length} results`);
+    return results;
+  }
+
+  // -----------------------------------------------------------------------
+  // Callbacks (ccmd event listener)
+  // -----------------------------------------------------------------------
+
+  onMessage(callback: (msg: MessageEvent) => void): void {
+    this.messageCallbacks.push(callback);
+  }
+
+  getContacts(): Map<string, string> {
+    return this.contacts;
+  }
+
+  // -----------------------------------------------------------------------
   // Search
   // -----------------------------------------------------------------------
 
@@ -550,9 +646,22 @@ export class WhatsAppClient {
     this.sock.ev.on('messages.upsert', ({ messages }) => {
       for (const msg of messages) {
         const jid = msg.key.remoteJid;
-        if (jid) {
-          const entry = this.waMessageToEntry(msg);
-          if (entry) this.buffer.upsert(jid, [entry]);
+        if (!jid) continue;
+        const entry = this.waMessageToEntry(msg);
+        if (!entry) continue;
+        this.buffer.upsert(jid, [entry]);
+        if (this.messageCallbacks.length > 0) {
+          const ev: MessageEvent = {
+            jid,
+            body: entry.body,
+            authorName: entry.authorName,
+            fromMe: entry.fromMe,
+            id: entry.id,
+            timestamp: entry.timestamp,
+          };
+          for (const cb of this.messageCallbacks) {
+            try { cb(ev); } catch (err) { log('error', 'messageCallback threw', err); }
+          }
         }
       }
     });
